@@ -1,0 +1,138 @@
+#include "intrinsics.h"
+#include <msp430.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <i2c_lcd.h>
+
+#define BUFFER_SIZE 100
+#define LCD_ADDR 0x27  
+const uint8_t setRate5Hz[] = {
+    0xB5, 0x62,     // Header
+    0x06, 0x08,     // Class = CFG, ID = RATE
+    0x06, 0x00,     // Payload length = 6 bytes
+    0xC8, 0x00,     // measRate = 200ms = 5Hz  (0x00C8 = 200)
+    0x01, 0x00,     // navRate = 1 (do not change)
+    0x01, 0x00,     // timeRef = 1 = UTC
+    0xDE, 0x6A      // Checksum (CK_A, CK_B)
+};
+void sendUBXCommand(const uint8_t* command, uint8_t length) {
+    volatile unsigned int i = 0;
+    for (i = 0; i < length; i++) {
+        while (!(UCA0IFG & UCTXIFG)); 
+        UCA0TXBUF = command[i];
+    }
+}
+volatile char nmeaBuffer[BUFFER_SIZE];
+volatile unsigned int bufferIndex = 0;
+volatile char sentenceReady = 0;
+
+char speedStr[16];
+char speedKnots[10];
+
+// === LCD via PCF8574T ===
+#define LCD_BACKLIGHT 0x08
+#define LCD_EN        0x04
+#define LCD_RS        0x01
+
+// === UART para GPS ===
+void uartInit() {
+    P3SEL |= BIT3 + BIT4; // P3.3 = TX, P3.4 = RX
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104; // 9600 baud (SMCLK = 1MHz)
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS_1;
+    UCA0CTL1 &= ~UCSWRST;
+    UCA0IE |= UCRXIE;
+}
+
+// === GPS Parsing ===
+void parseGPRMC(const char* sentence) {
+    char temp[BUFFER_SIZE];
+    strncpy(temp, sentence, BUFFER_SIZE);
+
+    char* token = strtok(temp, ",");
+    int field = 0;
+
+    while (token != NULL) {
+        if (field == 7) {
+            strncpy(speedKnots, token, sizeof(speedKnots));
+            break;
+        }
+        token = strtok(NULL, ",");
+        field++;
+    }
+}
+
+float knotsToKmH(float knots) {
+    return knots * 1.852;
+}
+
+void exibirVelocidade() {
+    float vel = knotsToKmH(atof(speedKnots));
+    int vel_int = (int)(vel * 10); 
+    int inteiro = vel_int / 10;
+    int decimal = vel_int % 10;
+
+    sprintf(speedStr, "%d.%d km/h", inteiro, decimal);
+
+    lcd_set_cursor(0, 0);
+    lcd_print("Velocidade:");
+    lcd_set_cursor(1, 0);
+    lcd_print("            "); 
+    lcd_set_cursor(1, 0);
+    lcd_print(speedStr);
+}
+
+// === MAIN ===
+void main(void) {
+    WDTCTL = WDTPW | WDTHOLD;
+
+    i2c_init();
+    lcd_init();
+    lcd_set_cursor(0, 0);
+    lcd_print("Teste LCD");
+    uartInit();
+    __delay_cycles(1000000);
+    sendUBXCommand(setRate5Hz, sizeof(setRate5Hz));
+
+    __enable_interrupt();
+
+    while (1) {
+        if (sentenceReady) {
+            sentenceReady = 0;
+
+            if (strncmp((char*)nmeaBuffer, "$GPRMC", 6) == 0) {
+                parseGPRMC((char*)nmeaBuffer);
+                exibirVelocidade();
+            }
+
+            bufferIndex = 0;
+            memset((char*)nmeaBuffer, 0, BUFFER_SIZE);
+        }
+    }
+}
+
+// === Interrupção UART ===
+volatile char c;
+#pragma vector=USCI_A0_VECTOR
+__interrupt void USCI_A0_ISR(void) {
+    switch (__even_in_range(UCA0IV, 4)) {
+        case 2:
+            c = UCA0RXBUF;
+            if (bufferIndex < BUFFER_SIZE - 1) {
+                nmeaBuffer[bufferIndex++] = c;
+                if (c == '\n') {
+                    nmeaBuffer[bufferIndex] = '\0';
+                    sentenceReady = 1;
+                }
+            } else {
+                bufferIndex = 0;
+            }
+            break;
+        default:
+            break;
+    }
+}
